@@ -2,7 +2,7 @@ name: Gdansk passport queue monitor
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
 
   workflow_dispatch:
 
@@ -27,15 +27,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install browser
+      - name: Install Playwright and Chromium
         run: |
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Check queue
+      - name: Check Gdansk queue
         run: python check_queue.py
 
-      - name: Save state
+      - name: Save current status
         if: always()
         run: |
           git config user.name "queue-monitor"
@@ -44,6 +44,6 @@ jobs:
           git add state.json
 
           if ! git diff --cached --quiet; then
-            git commit -m "Update queue status"
+            git commit -m "Update Gdansk queue status"
             git push
           fi
