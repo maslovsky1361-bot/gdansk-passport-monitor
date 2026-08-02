@@ -1,0 +1,44 @@
+name: Gdansk passport queue monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gdansk-passport-monitor
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check queue
+        run: python check_queue.py
+
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "queue-monitor"
+          git config user.email "queue-monitor@users.noreply.github.com"
+
+          git add state.json
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update queue status"
+            git push
+          fi
