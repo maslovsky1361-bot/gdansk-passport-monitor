@@ -45,5 +45,6 @@ jobs:
 
           if ! git diff --cached --quiet; then
             git commit -m "Update Gdansk queue status"
+            git pull --rebase
             git push
           fi
