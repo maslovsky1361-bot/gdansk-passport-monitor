@@ -11,27 +11,25 @@ from playwright.async_api import async_playwright
 
 QUEUE_URL = "https://gdansk.pasport.org.ua/solutions/e-queue"
 
-# Сейчас здесь тестовый токен.
-# Потом замени только значение между кавычками.
+# Тестовый токен. Потом замени только значение между кавычками.
 BOT_TOKEN = "8783949502:AAFfhkXCmxKL_8AzGt4sERxBEKyeY7uwFxA"
 
 STATE_FILE = Path("state.json")
 
 
 def telegram_api(method: str, data: dict | None = None) -> dict:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    """Выполняет запрос к Telegram Bot API."""
 
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     encoded_data = None
 
-    if data:
+    if data is not None:
         encoded_data = urllib.parse.urlencode(data).encode("utf-8")
 
     request = urllib.request.Request(
         url,
         data=encoded_data,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-        },
+        headers={"User-Agent": "Mozilla/5.0"},
     )
 
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -45,8 +43,9 @@ def telegram_api(method: str, data: dict | None = None) -> dict:
 
 def find_chat_id() -> str:
     """
-    Автоматически находит последний личный чат,
-    который написал этому Telegram-боту.
+    Находит последний личный чат, который написал боту.
+    Перед первым запуском нужно открыть бота, нажать Start
+    и отправить ему любое сообщение.
     """
 
     result = telegram_api("getUpdates")
@@ -70,13 +69,14 @@ def find_chat_id() -> str:
             return str(chat["id"])
 
     raise RuntimeError(
-        "Личный чат с ботом не найден. "
-        "Открой бота в Telegram, нажми Start "
-        "и отправь ему любое сообщение."
+        "Личный чат с ботом не найден. Открой бота в Telegram, "
+        "нажми Start и отправь ему любое сообщение."
     )
 
 
 def send_message(text: str) -> None:
+    """Отправляет сообщение в личный чат с ботом."""
+
     telegram_api(
         "sendMessage",
         {
@@ -88,6 +88,8 @@ def send_message(text: str) -> None:
 
 
 def load_state() -> dict:
+    """Загружает статус предыдущей проверки."""
+
     if not STATE_FILE.exists():
         return {
             "last_status": "unknown",
@@ -105,10 +107,15 @@ def load_state() -> dict:
         }
 
 
-def save_state(state: dict) -> None:
+def save_state(status: str, checked_at: str) -> None:
+    """Сохраняет результат текущей проверки."""
+
     STATE_FILE.write_text(
         json.dumps(
-            state,
+            {
+                "last_status": status,
+                "last_check": checked_at,
+            },
             ensure_ascii=False,
             indent=2,
         ),
@@ -118,124 +125,180 @@ def save_state(state: dict) -> None:
 
 async def check_page() -> str:
     """
-    Возможные результаты:
+    Возвращает один из статусов:
 
-    available — настоящая форма записи появилась;
-    no_slots — сайт прямо сообщает, что мест нет;
-    unknown — страница загрузилась нестандартно.
+    available — появилась настоящая форма записи;
+    no_slots — отображается «Наразі всі місця зайняті»;
+    unknown — состояние страницы не удалось определить.
     """
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=True,
             args=[
-                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
 
         context = await browser.new_context(
             locale="uk-UA",
             viewport={
-                "width": 430,
-                "height": 932,
+                "width": 1280,
+                "height": 1600,
             },
             user_agent=(
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 "
-                "like Mac OS X) AppleWebKit/605.1.15 "
-                "Version/18.0 Mobile/15E148 Safari/604.1"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
             ),
         )
 
         page = await context.new_page()
 
-        await page.goto(
-            QUEUE_URL,
-            wait_until="domcontentloaded",
-            timeout=90_000,
-        )
-
-        # Даём динамическим элементам страницы загрузиться.
-        await page.wait_for_timeout(10_000)
-
-        body_text = (
-            await page.locator("body").inner_text()
-        ).lower()
-
-        # 1. Проверяем наличие настоящего поля телефона.
-        phone_input_count = await page.locator(
-            'input[type="tel"], '
-            'input[placeholder*="+380"], '
-            'input[placeholder*="50 123"], '
-            'input[name*="phone" i]'
-        ).count()
-
-        phone_input_exists = phone_input_count > 0
-
-        # 2. Проверяем наличие настоящего select для услуги.
-        select_count = await page.locator("select").count()
-        select_exists = select_count > 0
-
-        # Дополнительная проверка подписи «Послуга».
-        service_label_count = await page.get_by_text(
-            re.compile(
-                r"^\s*послуга\s*\*?\s*$",
-                re.IGNORECASE,
+        try:
+            await page.goto(
+                QUEUE_URL,
+                wait_until="domcontentloaded",
+                timeout=90_000,
             )
-        ).count()
 
-        service_label_exists = service_label_count > 0
+            # Ждём появления либо красного сообщения,
+            # либо настоящей формы записи.
+            try:
+                await page.wait_for_function(
+                    """
+                    () => {
+                        const bodyText =
+                            (document.body?.innerText || '').toLowerCase();
 
-        # 3. Проверяем настоящую кнопку «Продовжити».
-        continue_button_count = await page.get_by_role(
-            "button",
-            name=re.compile(
-                r"^\s*продовжити\s*$",
-                re.IGNORECASE,
-            ),
-        ).count()
+                        const noSlots =
+                            bodyText.includes(
+                                'наразі всі місця зайняті'
+                            );
 
-        if continue_button_count == 0:
-            continue_button_count = await page.locator(
-                'input[type="submit"][value*="Продовжити" i]'
-            ).count()
+                        const phoneInput =
+                            document.querySelector(
+                                'input[type="tel"], ' +
+                                'input[name*="phone" i], ' +
+                                'input[placeholder*="+380"], ' +
+                                'input[placeholder*="50 123"]'
+                            );
 
-        continue_button_exists = continue_button_count > 0
+                        const serviceField =
+                            document.querySelector('select') ||
+                            bodyText.includes('послуга');
 
-        # Красное сообщение о занятых местах.
-        no_slots_exists = (
-            "наразі всі місця зайняті" in body_text
-        )
+                        const controls = [
+                            ...document.querySelectorAll(
+                                'button, input[type="submit"]'
+                            )
+                        ];
 
-        # Сохраняем скриншот внутри запуска GitHub.
-        await page.screenshot(
-            path="last_check.png",
-            full_page=True,
-        )
+                        const continueButton = controls.some(
+                            element => {
+                                const value = (
+                                    element.innerText ||
+                                    element.value ||
+                                    ''
+                                ).toLowerCase();
 
-        await browser.close()
+                                return value.includes('продовжити');
+                            }
+                        );
 
-        # Считаем, что запись появилась, только если
-        # одновременно найдены реальные элементы формы.
-        if (
-            phone_input_exists
-            and select_exists
-            and service_label_exists
-            and continue_button_exists
-        ):
-            return "available"
+                        return (
+                            noSlots ||
+                            (
+                                phoneInput &&
+                                serviceField &&
+                                continueButton
+                            )
+                        );
+                    }
+                    """,
+                    timeout=40_000,
+                )
+            except Exception:
+                # Если условие не появилось, всё равно анализируем страницу.
+                pass
 
-        if no_slots_exists:
-            return "no_slots"
+            await page.wait_for_timeout(3_000)
 
-        return "unknown"
+            body_text = (
+                await page.locator("body").inner_text()
+            ).lower()
+
+            # Точное сообщение об отсутствии мест.
+            no_slots = (
+                "наразі всі місця зайняті" in body_text
+            )
+
+            # Настоящее поле номера телефона.
+            phone_input = (
+                await page.locator(
+                    'input[type="tel"], '
+                    'input[name*="phone" i], '
+                    'input[placeholder*="+380"], '
+                    'input[placeholder*="50 123"]'
+                ).count()
+                > 0
+            )
+
+            # Настоящее поле выбора услуги.
+            select_exists = (
+                await page.locator("select").count()
+                > 0
+            )
+
+            service_label = (
+                await page.get_by_text(
+                    re.compile(
+                        r"^\s*послуга\s*\*?\s*$",
+                        re.IGNORECASE,
+                    )
+                ).count()
+                > 0
+            )
+
+            # Настоящая кнопка «Продовжити».
+            continue_button = (
+                await page.locator(
+                    'button:has-text("Продовжити"), '
+                    'input[type="submit"][value*="Продовжити" i]'
+                ).count()
+                > 0
+            )
+
+            await page.screenshot(
+                path="last_check.png",
+                full_page=True,
+            )
+
+            # Форма считается доступной только при одновременном
+            # наличии поля услуги, телефона и кнопки продолжения.
+            if (
+                phone_input
+                and (select_exists or service_label)
+                and continue_button
+            ):
+                return "available"
+
+            if no_slots:
+                return "no_slots"
+
+            return "unknown"
+
+        finally:
+            await browser.close()
 
 
 def status_name(status: str) -> str:
     names = {
         "available": "форма записи доступна",
         "no_slots": "все места заняты",
-        "unknown": "не удалось точно определить состояние страницы",
+        "unknown": "состояние страницы не удалось определить",
     }
 
     return names.get(status, status)
@@ -251,84 +314,77 @@ async def main() -> None:
 
     current_status = await check_page()
 
+    checked_at = datetime.now(
+        timezone.utc
+    ).strftime("%d.%m.%Y %H:%M:%S UTC")
+
     previous_name = status_name(previous_status)
     current_name = status_name(current_status)
 
-    checked_at = datetime.now(
-        timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    changed = current_status != previous_status
 
     print(f"Предыдущий статус: {previous_status}")
     print(f"Текущий статус: {current_status}")
     print(f"Время проверки: {checked_at}")
 
-    status_changed = current_status != previous_status
-
-    if status_changed:
-        if current_status == "available":
-            send_message(
+    if current_status == "available":
+        if changed:
+            message = (
                 "🚨 В ГДАНЬСКЕ ПОЯВИЛАСЬ ФОРМА ЗАПИСИ!\n\n"
-                f"Предыдущий статус: {previous_name}\n"
-                f"Новый статус: {current_name}\n\n"
-                "Найдены реальные элементы формы:\n"
+                f"Было: {previous_name}\n"
+                f"Стало: {current_name}\n\n"
+                "Найдены:\n"
                 "• выбор услуги;\n"
-                "• номер телефона;\n"
+                "• поле номера телефона;\n"
                 "• кнопка «Продовжити».\n\n"
                 "Открывай страницу и бронируй:\n"
                 f"{QUEUE_URL}"
             )
+        else:
+            message = (
+                "🚨 Проверка выполнена.\n\n"
+                "Статус без изменений: форма записи "
+                "по-прежнему доступна.\n\n"
+                f"{QUEUE_URL}"
+            )
 
-        elif current_status == "no_slots":
-            send_message(
+    elif current_status == "no_slots":
+        if changed:
+            message = (
                 "ℹ️ Статус очереди изменился.\n\n"
                 f"Было: {previous_name}\n"
                 f"Стало: {current_name}\n\n"
-                "Сейчас на странице указано:\n"
+                "На странице сейчас указано:\n"
                 "«Наразі всі місця зайняті».\n\n"
                 f"{QUEUE_URL}"
             )
-
         else:
-            send_message(
-                "⚠️ Статус страницы изменился.\n\n"
-                f"Было: {previous_name}\n"
-                f"Стало: {current_name}\n\n"
-                "Сайт загрузился нестандартно. "
-                "Это не означает, что места появились.\n\n"
-                f"{QUEUE_URL}"
-            )
-
-    else:
-        if current_status == "available":
-            send_message(
-                "✅ Проверка выполнена.\n\n"
-                "Статус без изменений: "
-                "форма записи по-прежнему доступна.\n\n"
-                f"{QUEUE_URL}"
-            )
-
-        elif current_status == "no_slots":
-            send_message(
+            message = (
                 "✅ Проверка выполнена.\n\n"
                 "Статус без изменений: "
                 "все места по-прежнему заняты.\n\n"
                 f"{QUEUE_URL}"
             )
 
-        else:
-            send_message(
+    else:
+        if changed:
+            message = (
                 "⚠️ Проверка выполнена.\n\n"
-                "Статус без изменений: "
-                "страница снова загрузилась нестандартно.\n\n"
+                f"Статус изменился: {current_name}.\n\n"
+                "Это не означает, что места появились. "
+                "Сайт мог загрузиться не полностью.\n\n"
+                f"{QUEUE_URL}"
+            )
+        else:
+            message = (
+                "⚠️ Проверка выполнена.\n\n"
+                "Статус без изменений: состояние страницы "
+                "снова не удалось определить.\n\n"
                 f"{QUEUE_URL}"
             )
 
-    save_state(
-        {
-            "last_status": current_status,
-            "last_check": checked_at,
-        }
-    )
+    send_message(message)
+    save_state(current_status, checked_at)
 
 
 if __name__ == "__main__":
